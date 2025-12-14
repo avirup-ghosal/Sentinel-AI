@@ -1,0 +1,87 @@
+id: scan-repo
+namespace: secureopsai
+
+description: |
+  Clone a GitHub repository, run real security scans (Trivy + Gitleaks),
+  and emit the exact commit SHA that was scanned. This commit SHA is later
+  used by the backend to clone the repo only once for AI remediation.
+
+inputs:
+  - name: repoUrl
+    type: STRING
+    required: true
+
+  - name: jobId
+    type: STRING
+    required: true
+
+tasks:
+  # 1️ Prepare isolated working directory
+  - id: prepare-workdir
+    type: io.kestra.plugin.scripts.shell.Commands
+    commands:
+      - mkdir -p /tmp/kestra-wd/{{ inputs.jobId }}
+
+  # 2️ Clone repository (SINGLE source of truth)
+  - id: clone-repo
+    type: io.kestra.plugin.git.Clone
+    url: "{{ inputs.repoUrl }}"
+    branch: main
+    directory: /tmp/kestra-wd/{{ inputs.jobId }}
+
+  # 3️ Capture the exact commit SHA that was scanned
+  - id: capture-commit-sha
+    type: io.kestra.plugin.scripts.shell.Commands
+    workingDirectory: /tmp/kestra-wd/{{ inputs.jobId }}
+    commands:
+      - git rev-parse HEAD > commit-sha.txt
+    outputFiles:
+      - commit-sha.txt
+
+  # 4️ Run Trivy filesystem vulnerability scan (REAL)
+  - id: trivy-scan
+    type: io.kestra.plugin.scripts.shell.Commands
+    workingDirectory: /tmp/kestra-wd/{{ inputs.jobId }}
+    commands:
+      - |
+        docker run --rm \
+          -v $(pwd):/workspace \
+          aquasec/trivy:latest \
+          fs /workspace \
+          --severity HIGH,CRITICAL \
+          --format json \
+          --output trivy-report.json
+    outputFiles:
+      - trivy-report.json
+
+  # 5️ Run Gitleaks secrets scan (REAL)
+  - id: gitleaks-scan
+    type: io.kestra.plugin.scripts.shell.Commands
+    workingDirectory: /tmp/kestra-wd/{{ inputs.jobId }}
+    commands:
+      - |
+        docker run --rm \
+          -v $(pwd):/workspace \
+          zricethezav/gitleaks:latest \
+          detect \
+          --source /workspace \
+          --report-format json \
+          --report-path gitleaks-report.json \
+          --no-git
+    outputFiles:
+      - gitleaks-report.json
+
+outputs:
+  # Single source of truth for remediation
+  - id: commitSha
+    type: STRING
+    value: "{{ outputs['capture-commit-sha'].outputFiles['commit-sha.txt'] }}"
+
+  # Security scan artifacts
+  - id: trivyReport
+    type: STRING
+    value: "{{ outputs['trivy-scan'].outputFiles['trivy-report.json'] }}"
+
+  - id: gitleaksReport
+    type: STRING
+    value: "{{ outputs['gitleaks-scan'].outputFiles['gitleaks-report.json'] }}"
