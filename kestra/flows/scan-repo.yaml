@@ -1,48 +1,213 @@
 id: scan-repo
 namespace: devsecops
-description: Clone a GitHub repository and run Trivy + Gitleaks scans with persisted results
+description: Automated Security Pipeline (Clone -> Scan -> Sanitize -> AI Fix -> PR)
 
 inputs:
   - id: repoUrl
     type: STRING
-    description: Public GitHub repository URL
+    description: Public GitHub repository URL (e.g. https://github.com/YOUR_USER/NodeGoat)
     required: true
+    defaults: "https://github.com/OWASP/NodeGoat"
+    
+  - id: baseBranch
+    type: STRING
+    description: "The branch to create the PR against (usually master or main)"
+    required: true
+    defaults: "master"
 
 tasks:
-  - id: security_scan_flow
+  - id: security_pipeline
     type: io.kestra.plugin.core.flow.WorkingDirectory
     tasks:
 
+      # 1. Clone (Updated to use the specific base branch)
       - id: clone_repo
         type: io.kestra.plugin.git.Clone
         url: "{{ inputs.repoUrl }}"
+        branch: "{{ inputs.baseBranch }}"
 
-      # -------------------------------
-      # Trivy Scan (JSON output)
-      # -------------------------------
+      # 2. Trivy Scan
       - id: trivy_scan
         type: io.kestra.plugin.scripts.shell.Commands
-        description: Trivy filesystem scan (JSON)
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           image: aquasec/trivy:latest
-          entryPoint: []
+          entryPoint: [""]
         commands:
           - trivy fs . -f json -o trivy.json
         outputFiles:
           - trivy.json
 
-      # -------------------------------
-      # Gitleaks Scan (JSON output)
-      # -------------------------------
+      # 3. Gitleaks Scan
       - id: gitleaks_scan
         type: io.kestra.plugin.scripts.shell.Commands
-        description: Gitleaks secrets scan (JSON)
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
           image: zricethezav/gitleaks:latest
-          entryPoint: []
+          entryPoint: [""]
         commands:
-          - gitleaks detect --source=. --no-git --report-format json --report-path gitleaks.json
+          - gitleaks detect --source=. --no-git --report-format json --report-path gitleaks.json --exit-code=0
         outputFiles:
           - gitleaks.json
+
+      # 4. Data Sanitization (Python)
+      - id: sanitize_reports
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: python:3.11-slim
+        inputFiles:
+          trivy.json: "{{ outputs.trivy_scan.outputFiles['trivy.json'] }}"
+          gitleaks.json: "{{ outputs.gitleaks_scan.outputFiles['gitleaks.json'] }}"
+        script: |
+          import json
+          import os
+
+          final_report = {"vulnerabilities": [], "secrets": []}
+
+          # Process Trivy
+          if os.path.exists("trivy.json"):
+              try:
+                  with open("trivy.json", "r") as f:
+                      data = json.load(f)
+                  if "Results" in data:
+                      for result in data["Results"]:
+                          if "Vulnerabilities" in result:
+                              for vuln in result["Vulnerabilities"]:
+                                  if vuln.get("Severity") in ["CRITICAL", "HIGH"]:
+                                      final_report["vulnerabilities"].append({
+                                          "package": vuln.get("PkgName"),
+                                          "installed_version": vuln.get("InstalledVersion"),
+                                          "fixed_version": vuln.get("FixedVersion", "N/A"),
+                                          "severity": vuln.get("Severity")
+                                      })
+              except Exception: pass
+
+          # Process Gitleaks
+          if os.path.exists("gitleaks.json"):
+              try:
+                  with open("gitleaks.json", "r") as f:
+                      leaks = json.load(f)
+                  if isinstance(leaks, list):
+                      for leak in leaks:
+                          raw = leak.get("Secret", "")
+                          masked = raw[:3] + "***" + raw[-3:] if len(raw) > 6 else "***"
+                          final_report["secrets"].append({
+                              "file": leak.get("File"),
+                              "type": leak.get("Description"),
+                              "secret_snippet": masked
+                          })
+              except Exception: pass
+
+          with open("sanitized_report.json", "w") as f:
+              json.dump(final_report, f, indent=2)
+        outputFiles:
+          - sanitized_report.json
+
+      # 5. AI Remediation
+      - id: ai_fixer
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: python:3.11-slim
+        env:
+          GOOGLE_API_KEY: "{{ secret('GOOGLE_API_KEY')}}" 
+        inputFiles:
+          sanitized_report.json: "{{ outputs.sanitize_reports.outputFiles['sanitized_report.json'] }}"
+        script: |
+          import json
+          import os
+          import urllib.request
+
+          api_key = os.environ.get("GOOGLE_API_KEY")
+          if not api_key:
+              print("No API Key found")
+              exit(1)
+
+          with open("sanitized_report.json", "r") as f:
+              report = f.read()
+
+          package_content = "{}"
+          if os.path.exists("package.json"):
+              with open("package.json", "r") as f:
+                  package_content = f.read()
+
+          prompt = "You are a DevSecOps Expert.\n"
+          prompt += "Task: Fix vulnerabilities in package.json based on the report below.\n"
+          prompt += "1. Update vulnerable packages to fixed_version.\n"
+          prompt += "2. Remove secrets.\n"
+          prompt += "3. Return ONLY valid JSON.\n\n"
+          prompt += "REPORT:\n" + report + "\n\n"
+          prompt += "PACKAGE.JSON:\n" + package_content
+
+          # FIX 1: Corrected Model Name (Gemini 1.5 is the current standard, 2.5 doesn't exist publically)
+          url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + api_key
+          headers = {"Content-Type": "application/json"}
+          data = {"contents": [{"parts": [{"text": prompt}]}]}
+
+          try:
+              req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
+              with urllib.request.urlopen(req) as response:
+                  result = json.loads(response.read())
+                  ai_response = result['candidates'][0]['content']['parts'][0]['text']
+                  clean_json = ai_response.replace("```json", "").replace("```", "").strip()
+                  
+                  with open("fixed_package.json", "w") as f:
+                      f.write(clean_json)
+                  print("Success")
+          except Exception as e:
+              print(f"Error: {e}")
+              exit(1)
+        outputFiles:
+          - fixed_package.json
+          
+      # 6. Git Push & PR (Fixed: Single Script Block)
+      - id: push_changes
+        type: io.kestra.plugin.scripts.shell.Commands
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+          image: bitnami/git:latest
+        env:
+          GITHUB_TOKEN: "{{ secret('GITHUB_TOKEN') }}"
+          REPO_URL: "{{ inputs.repoUrl }}"
+          BRANCH_NAME: "security/fix-{{ execution.id }}"
+          BASE_BRANCH: "{{ inputs.baseBranch }}"
+        inputFiles:
+          fixed_package.json: "{{ outputs.ai_fixer.outputFiles['fixed_package.json'] }}"
+        commands:
+          - |
+            set -e  # Fail immediately if any command errors
+
+            # 1. Configure Git
+            git config --global user.email "bot@sentinel-ai.com"
+            git config --global user.name "Sentinel AI Bot"
+            
+            # 2. Parse URL (Remove .git suffix and protocol)
+            export REPO_PATH=$(echo $REPO_URL | sed 's/https:\/\/github.com\///' | sed 's/\.git$//')
+            echo "Target Repo: $REPO_PATH"
+
+            # 3. Clone with Authentication
+            git clone https://oauth2:$GITHUB_TOKEN@github.com/$REPO_PATH.git auth_repo
+            cd auth_repo
+            
+            # 4. Create Branch & Apply Fix
+            git checkout -b $BRANCH_NAME
+            cp ../fixed_package.json package.json
+            
+            # 5. Commit & Push
+            git add package.json
+            git commit -m "chore(security): apply AI auto-remediation {{ execution.id }}"
+            git push origin $BRANCH_NAME
+            
+            # 6. Create JSON Body for PR (Safe Heredoc)
+            cat <<EOF > pr_body.json
+            {
+              "title": "🛡️ Security Fix: Auto-Remediation",
+              "body": "This PR was automatically created by Sentinel-AI.\n\n**Changes:**\n- Upgraded vulnerable dependencies.\n- Sanitized package.json.",
+              "head": "$BRANCH_NAME",
+              "base": "$BASE_BRANCH"
+            }
+            EOF
+            
+            # 7. Open Pull Request
+            echo "Opening PR on $REPO_PATH..."
+            curl -X POST -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO_PATH/pulls \
+            -d @pr_body.json

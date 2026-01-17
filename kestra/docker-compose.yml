@@ -10,9 +10,9 @@ services:
     shm_size: 1gb
     restart: unless-stopped
     environment:
-      POSTGRES_DB: kestra
-      POSTGRES_USER: kestra
-      POSTGRES_PASSWORD: k3str4
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -36,22 +36,25 @@ services:
     volumes:
       - kestra-data:/app/storage
       - /var/run/docker.sock:/var/run/docker.sock
-      - /tmp/kestra-wd:/tmp/kestra-wd
+      - /home/avirupghosal/Projects/kestra-ops/kestra/workdir:/tmp/kestra-wd
+      - /home/avirupghosal/Projects/kestra-ops/kestra/flows:/local_flows
     environment:
+      SECRET_GOOGLE_API_KEY: ${GOOGLE_API_KEY_64}
+      SECRET_GITHUB_TOKEN: ${GITHUB_TOKEN_64}
       KESTRA_CONFIGURATION: |
         datasources:
           postgres:
-            url: jdbc:postgresql://postgres:5432/kestra
+            url: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
             driverClassName: org.postgresql.Driver
-            username: kestra
-            password: k3str4
+            username: ${POSTGRES_USER}
+            password: ${POSTGRES_PASSWORD}
 
         kestra:
           server:
             basic-auth:
               enabled: true
-              username: admin@kestra.io
-              password: Admin1234
+              username: ${KESTRA_USERNAME}
+              password: ${KESTRA_PASSWORD}
 
           repository:
             type: postgres
@@ -69,3 +72,10 @@ services:
               path: /tmp/kestra-wd/tmp
 
           url: http://localhost:8080/
+        
+        micronaut:
+          io:
+            watch:
+              enabled: true              
+              paths:
+                - /local_flows
